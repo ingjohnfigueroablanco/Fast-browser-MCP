@@ -6,14 +6,15 @@ import asyncio
 from collections.abc import Callable
 
 from ..cdp.connection import CDPConnection
-
-SessionIdFn = Callable[[], "str | None"]
 from ..config import (
     NAVIGATION_TIMEOUT,
     NETWORKIDLE_QUIET_SECONDS,
     READYSTATE_POLL_TIMEOUT,
     WAIT_FOR_POLL_INTERVAL,
 )
+from ..errors import CdpProtocolError
+
+SessionIdFn = Callable[[], "str | None"]
 
 
 async def wait_load(conn: CDPConnection, get_session_id: SessionIdFn, timeout: float = NAVIGATION_TIMEOUT) -> None:
@@ -43,8 +44,8 @@ async def wait_load(conn: CDPConnection, get_session_id: SessionIdFn, timeout: f
     while loop.time() < deadline:
         try:
             ready = await _eval(conn, "document.readyState", get_session_id())
-        except RuntimeError as exc:
-            if "session" in str(exc).lower() or "not found" in str(exc).lower():
+        except CdpProtocolError as exc:
+            if "session" in exc.message.lower() or "not found" in exc.message.lower():
                 await asyncio.sleep(0.05)
                 continue
             raise
@@ -100,8 +101,8 @@ async def wait_for_text(
     while loop.time() < deadline:
         try:
             body = await _eval(conn, expr, get_session_id()) or ""
-        except RuntimeError as exc:
-            if "session" in str(exc).lower() or "not found" in str(exc).lower():
+        except CdpProtocolError as exc:
+            if "session" in exc.message.lower() or "not found" in exc.message.lower():
                 await asyncio.sleep(WAIT_FOR_POLL_INTERVAL)
                 continue
             raise

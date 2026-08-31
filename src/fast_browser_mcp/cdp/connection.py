@@ -18,6 +18,13 @@ from typing import Any
 from cdp_use.client import CDPClient
 
 from ..config import CDP_COMMAND_TIMEOUT
+from ..errors import (
+    CdpProtocolError,
+    ConnectionLostError,
+    NavigatedDuringExecutionError,
+    TimeoutBrowserError,
+    classify_cdp_error,
+)
 
 EventCallback = Callable[[dict, str | None], None]
 
@@ -58,13 +65,43 @@ class CDPConnection:
         session_id: str | None = None,
         timeout: float = CDP_COMMAND_TIMEOUT,
     ) -> dict[str, Any]:
-        """Send a CDP command and await its result."""
+        """Send a CDP command and await its result.
+
+        Raises a ``BrowserError`` subclass with an explicit ``code`` instead of
+        letting raw asyncio/cdp_use exceptions (some with empty ``str()``,
+        e.g. ``asyncio.TimeoutError``) reach the tool layer as a blank message.
+        """
         if self._client is None:
-            raise RuntimeError("CDP no conectado. Llama browser_start primero.")
-        return await asyncio.wait_for(
-            self._client.send_raw(method, params or {}, session_id),
-            timeout=timeout,
-        )
+            raise TimeoutBrowserError(
+                "CDP no conectado. Llama browser_start primero.", detail={"method": method}
+            )
+        try:
+            return await asyncio.wait_for(
+                self._client.send_raw(method, params or {}, session_id),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            raise TimeoutBrowserError(
+                f"{method} no respondio en {timeout}s (session_id={session_id})",
+                detail={"method": method, "timeout": timeout, "session_id": session_id},
+            ) from exc
+        except ConnectionError as exc:
+            raise ConnectionLostError(
+                f"Conexion CDP perdida durante {method}: {exc}",
+                detail={"method": method},
+            ) from exc
+        except RuntimeError as exc:
+            # cdp_use wraps the raw CDP error payload (a dict) as RuntimeError's
+            # single arg; str(exc) still renders it usefully, but classify it
+            # so callers can branch on .code instead of substring-matching.
+            msg = str(exc)
+            code = classify_cdp_error(msg)
+            if code == "NAVIGATED_DURING_EXECUTION":
+                raise NavigatedDuringExecutionError(
+                    f"{method} interrumpido por navegacion: {msg}",
+                    detail={"method": method},
+                ) from exc
+            raise CdpProtocolError(msg, detail={"method": method}) from exc
 
     # --- events --------------------------------------------------------------
     def on(self, method: str, callback: EventCallback) -> None:

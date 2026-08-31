@@ -12,11 +12,35 @@ import subprocess
 from ..actions import forms, keyboard, mouse
 from ..cdp.connection import CDPConnection
 from ..cdp.events import EventBuffers, NetEntry
+from ..errors import BrowserNotStartedError, CdpProtocolError, ElementGoneError, NavigatedDuringExecutionError
 from ..chrome import launcher, ws_url
 from ..config import Config
 from ..snapshot import collector
 from ..snapshot.refmap import RefMap
 from . import waits
+from .inject import PersistentScripts
+
+
+def _extract_js_exception(exception_details: dict) -> str:
+    """Pull the actual JS error message out of a CDP exceptionDetails object.
+
+    ``exceptionDetails.text`` is almost always the useless literal "Uncaught"
+    — the real message (including the stack) lives on
+    ``exceptionDetails.exception.description`` for thrown Error objects, or
+    ``.value`` for a thrown primitive (string/number). Fall back through both
+    before resorting to ``.text`` or the raw dict.
+    """
+    exc = exception_details.get("exception") or {}
+    description = exc.get("description")
+    if description:
+        return str(description)
+    value = exc.get("value")
+    if value is not None:
+        return str(value)
+    text = exception_details.get("text")
+    if text:
+        return str(text)
+    return str(exception_details)
 
 
 class BrowserManager:
@@ -29,6 +53,8 @@ class BrowserManager:
         self._target_id: str | None = None
         self._child_sessions: list[str] = []
         self._refmap = RefMap()
+        self._warm_ax_sessions: set[str | None] = set()
+        self._injected = PersistentScripts()
         self._lock = asyncio.Lock()
 
     # --- lifecycle -----------------------------------------------------------
@@ -136,6 +162,11 @@ class BrowserManager:
         assert self._conn is not None
         for domain in ("Page", "DOM", "Runtime", "Network", "Log", "Accessibility"):
             await self._conn.call(f"{domain}.enable", session_id=self._session_id)
+        # Registrations from Page.addScriptToEvaluateOnNewDocument are scoped
+        # to the session/target they were made on; a cross-origin nav that
+        # swaps _session_id (see _on_attached) leaves the OLD registrations
+        # behind with the dead target, so every (re)enable reinstalls them.
+        await self._injected.install_all(self._conn, self._session_id)
 
     async def shutdown(self, kill: bool = False) -> dict:
         if self._conn is not None:
@@ -147,12 +178,49 @@ class BrowserManager:
         return {"status": "stopped", "killed": kill}
 
     # --- navigation + snapshot ----------------------------------------------
-    async def navigate(self, url: str, wait: str = "load") -> None:
+    async def _read_fbm_marker(self) -> float | None:
+        """Read window.__fbm.installedAt (the Date.now() timestamp of when the
+        bootstrap script last ran), or None if it hasn't run at all (blocked
+        by CSP, about:blank).
+
+        This — not the persisted `epoch` counter — is what detects an actual
+        reload: a genuine navigation always creates a brand-new `window`, so
+        the bootstrap re-runs and installedAt changes, unconditionally. The
+        `epoch` counter round-trips through localStorage instead, which is
+        the right signal for "how many reloads has this ORIGIN seen" but is
+        unreliable here: an opaque origin (e.g. a `data:` URL, a sandboxed
+        iframe) has no persistent storage across navigations, so epoch alone
+        would misreport a genuine reload as a same-document transition.
+        """
+        try:
+            res = await self._conn.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "window.__fbm ? window.__fbm.installedAt : null",
+                    "returnByValue": True,
+                },
+                session_id=self._session_id,
+            )
+            return (res.get("result") or {}).get("value")
+        except Exception:
+            return None
+
+    async def navigate(self, url: str, wait: str = "load") -> dict:
+        """Navigate to url. Returns {"reloaded": bool} — True if the target
+        document was actually torn down and recreated (the normal case for
+        Page.navigate: any window state / injected helpers the LLM defined
+        are gone), False for a same-document navigation (e.g. a hash change)
+        where the existing window survived. Unknown when the bootstrap script
+        couldn't run (about:blank, strict CSP) — reported as reloaded=True
+        since that's the safe assumption for "did I lose my state".
+        """
         conn = self._require_conn()
+        self._warm_ax_sessions.clear()
+        marker_before = await self._read_fbm_marker()
         try:
             await conn.call("Page.navigate", {"url": url}, session_id=self._session_id)
-        except RuntimeError as exc:
-            if "not found" in str(exc).lower() or "session" in str(exc).lower():
+        except CdpProtocolError as exc:
+            if "not found" in exc.message.lower() or "session" in exc.message.lower():
                 # Session went stale (e.g. Chrome closed/replaced the tab). Reattach.
                 await self._attach_to_page()
                 await self._enable_domains()
@@ -163,6 +231,9 @@ class BrowserManager:
             await waits.wait_load(conn, lambda: self._session_id)
         elif wait == "networkidle":
             await waits.wait_networkidle(conn, self._session_id)
+        marker_after = await self._read_fbm_marker()
+        reloaded = marker_before is None or marker_after is None or marker_after != marker_before
+        return {"reloaded": reloaded}
 
     async def snapshot(self, interactive_only: bool = True) -> dict:
         conn = self._require_conn()
@@ -172,6 +243,7 @@ class BrowserManager:
             self._session_id,
             child_sessions=self._child_sessions,
             interactive_only=interactive_only,
+            warm_sessions=self._warm_ax_sessions,
         )
         return {"snapshot_id": snap_id, "snapshot": text, "refs": len(self._refmap)}
 
@@ -219,27 +291,40 @@ class BrowserManager:
         return await self.snapshot()
 
     # --- js / cdp escape hatches ---------------------------------------------
-    async def js_eval(self, script: str, ref: str | None = None) -> dict:
+    async def js_eval(
+        self, script: str, ref: str | None = None, timeout_ms: int | None = None
+    ) -> dict:
         """Execute arbitrary JS in the page context.
 
         ref=None  → Runtime.evaluate(script)          (expression mode)
         ref=@eN   → Runtime.callFunctionOn(script)     (function bound to element as `this`)
 
-        Returns {"js_result": <value>, "exception": <msg|None>} + snapshot fields.
+        Returns {"js_result": <value>, "exception": <msg|None>,
+        "snapshot_error": <msg|None>} + snapshot fields.
         awaitPromise=True so async scripts work; returnByValue serialises primitives/objects.
+
+        A TIMEOUT/NAVIGATED_DURING_EXECUTION from the eval call itself still
+        propagates (there is no partial js_result to salvage in that case).
+        But once the eval call has returned, the closing snapshot() is never
+        allowed to swallow that result: if the script navigated the page and
+        the snapshot fails, js_result/exception are still returned alongside a
+        snapshot_error, instead of the whole call raising and the caller
+        being unable to tell whether the script itself ran.
         """
         conn = self._require_conn()
         exception = None
+        call_kwargs = {"timeout": timeout_ms / 1000.0} if timeout_ms else {}
 
         if ref is None:
             res = await conn.call(
                 "Runtime.evaluate",
                 {"expression": script, "returnByValue": True, "awaitPromise": True},
                 session_id=self._session_id,
+                **call_kwargs,
             )
             value = (res.get("result") or {}).get("value")
             if res.get("exceptionDetails"):
-                exception = str(res["exceptionDetails"].get("text") or res["exceptionDetails"])
+                exception = _extract_js_exception(res["exceptionDetails"])
         else:
             entry = self._refmap.resolve(ref)
             obj = await conn.call(
@@ -247,19 +332,38 @@ class BrowserManager:
                 session_id=entry.session_id,
             )
             object_id = (obj.get("object") or {}).get("objectId")
+            if object_id is None:
+                raise ElementGoneError(
+                    f"{ref} ya no resuelve a un nodo vivo (backend_node_id="
+                    f"{entry.backend_node_id}). Vuelve a llamar snapshot."
+                )
             res = await conn.call(
                 "Runtime.callFunctionOn",
                 {"objectId": object_id, "functionDeclaration": script,
                  "returnByValue": True, "awaitPromise": True},
                 session_id=entry.session_id,
+                **call_kwargs,
             )
             value = (res.get("result") or {}).get("value")
             if res.get("exceptionDetails"):
-                exception = str(res["exceptionDetails"].get("text") or res["exceptionDetails"])
+                exception = _extract_js_exception(res["exceptionDetails"])
 
-        snap = await self.snapshot()
-        return {"js_result": value, "exception": exception,
-                "snapshot_id": snap["snapshot_id"], "snapshot": snap["snapshot"], "refs": snap["refs"]}
+        snapshot_error = None
+        snap = None
+        try:
+            snap = await self.snapshot()
+        except (NavigatedDuringExecutionError, CdpProtocolError) as exc:
+            snapshot_error = str(exc)
+
+        if snap is None:
+            return {
+                "js_result": value, "exception": exception, "snapshot_error": snapshot_error,
+                "snapshot_id": self._refmap.snapshot_id, "snapshot": "", "refs": 0,
+            }
+        return {
+            "js_result": value, "exception": exception, "snapshot_error": snapshot_error,
+            "snapshot_id": snap["snapshot_id"], "snapshot": snap["snapshot"], "refs": snap["refs"],
+        }
 
     async def cdp_call(self, method: str, params: dict | None = None, use_session: bool = True) -> dict:
         """Pass-through for any CDP domain.method call.
@@ -373,8 +477,10 @@ class BrowserManager:
         res = await conn.call("Page.captureScreenshot", params, session_id=self._session_id)
         return res.get("data", "")
 
-    def read_console(self, clear: bool = False) -> list[str]:
-        return self._events.read_console(clear) if self._events else []
+    def read_console(
+        self, clear: bool = False, level: str | None = None, since_ms: int | None = None
+    ) -> list[str]:
+        return self._events.read_console(clear, level=level, since_ms=since_ms) if self._events else []
 
     def read_network(self, filter_substr: str | None, clear: bool = False) -> list[NetEntry]:
         return self._events.read_network(filter_substr, clear) if self._events else []
@@ -382,10 +488,33 @@ class BrowserManager:
     async def current_url(self) -> dict:
         return {"url": await self._current_url(), "title": await self._title()}
 
+    # --- persistent (survives-navigation) helpers ----------------------------
+    async def inject_persistent(self, script: str, identifier: str) -> dict:
+        """Register `script` to re-run on every future document via
+        Page.addScriptToEvaluateOnNewDocument, then install it immediately in
+        the current document too (the registration only affects FUTURE
+        documents, not the one already loaded)."""
+        conn = self._require_conn()
+        self._injected.add(identifier, script)
+        await self._injected.install_all(conn, self._session_id)
+        try:
+            await conn.call(
+                "Runtime.evaluate", {"expression": script}, session_id=self._session_id
+            )
+        except Exception:
+            pass  # best-effort in the CURRENT document; it's live from the next one on
+        return {"identifier": identifier}
+
+    def list_persistent(self) -> list[str]:
+        return self._injected.list_ids()
+
+    def remove_persistent(self, identifier: str) -> bool:
+        return self._injected.remove(identifier)
+
     # --- helpers -------------------------------------------------------------
     def _require_conn(self) -> CDPConnection:
         if self._conn is None or not self._conn.is_connected:
-            raise RuntimeError("BROWSER_NOT_STARTED: llama browser_start primero.")
+            raise BrowserNotStartedError("Llama browser_start primero.")
         return self._conn
 
     async def _current_url(self) -> str:

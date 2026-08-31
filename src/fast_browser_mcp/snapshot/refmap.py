@@ -32,9 +32,16 @@ class RefMap:
         self.current_session: str | None = None
 
     def begin(self) -> int:
+        """Start a new snapshot generation.
+
+        The ref counter is deliberately NOT reset here. If it were, an @eN
+        from a stale (previous-generation) snapshot would almost always still
+        exist as a key in the new generation's dict — silently resolving to
+        the WRONG node instead of raising StaleRefError. Refs stay monotonic
+        for the process lifetime so a stale ref reliably misses.
+        """
         self.snapshot_id += 1
         self._entries.clear()
-        self._counter = 0
         return self.snapshot_id
 
     def assign(

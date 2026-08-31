@@ -124,10 +124,41 @@ The browser runs **inside the container**. `localhost` inside Docker ≠ your de
 | `cdp_call` | **Raw CDP protocol** — file upload, device emulation, network intercept |
 | `get_text` | innerText of element or full page |
 | `wait_for` | Wait until text appears on page |
-| `read_console` | JS console logs |
+| `read_console` | JS console logs (filter by `level`/`since_ms`) |
 | `read_network` | Network requests / responses |
 | `screenshot` | PNG base64 (escape hatch) |
 | `current_url` | Current URL + title |
+| `inject_persistent` | Register a JS helper that survives `navigate()` (a full reload otherwise wipes `window`) |
+| `list_persistent` | List identifiers of registered persistent scripts |
+| `remove_persistent` | Remove a persistent script by identifier |
+
+### Error format
+
+Every tool catches its own failures and returns `ERROR code=<CODE> msg=<detail>`
+instead of raising — `code` is one of `TIMEOUT`, `CONNECTION_LOST`,
+`NAVIGATED_DURING_EXECUTION`, `JS_EXCEPTION`, `STALE_REF`,
+`ELEMENT_NOT_VISIBLE`, `ELEMENT_GONE`, `BROWSER_NOT_STARTED`, `CDP_ERROR`,
+`BAD_ARGUMENT`. A `TIMEOUT` never comes back as a blank message.
+
+### `@eN` refs are single-use per snapshot
+
+Every action tool returns a fresh snapshot with new `@eN` refs — always use
+the refs from the MOST RECENT snapshot. A ref from an older snapshot raises
+`STALE_REF` rather than silently resolving to a different element.
+
+### `navigate` always destroys `window` state
+
+`navigate` is a full page load (like typing a URL and pressing Enter) — any
+variable/function you defined via `js_eval` is gone afterward. The tool
+reports `reloaded=true|false` on every call so you know when this happened;
+use `inject_persistent` for helpers that need to survive it.
+
+### `click` vs `js_click`
+
+`click` dispatches real CDP mouse events only (matches what a user click
+fires, including React 17+ delegated handlers) — it does **not** also fire a
+JS `element.click()`, which would double-trigger the handler. Use `js_click`
+explicitly when CDP mouse events genuinely don't reach a handler.
 
 ---
 
