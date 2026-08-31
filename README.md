@@ -124,10 +124,79 @@ The browser runs **inside the container**. `localhost` inside Docker ≠ your de
 | `cdp_call` | **Raw CDP protocol** — file upload, device emulation, network intercept |
 | `get_text` | innerText of element or full page |
 | `wait_for` | Wait until text appears on page |
-| `read_console` | JS console logs |
+| `read_console` | JS console logs (filter by `level`/`since_ms`) |
 | `read_network` | Network requests / responses |
 | `screenshot` | PNG base64 (escape hatch) |
 | `current_url` | Current URL + title |
+| `inject_persistent` | Register a JS helper that survives `navigate()` (a full reload otherwise wipes `window`) |
+| `list_persistent` | List identifiers of registered persistent scripts |
+| `remove_persistent` | Remove a persistent script by identifier |
+| `click_popup_option` | Resolve the currently-open dropdown/menu/listbox and click the matching option, in one call |
+| `act_and_observe` | Act, then watch the DOM/console for `watch_ms` — one call instead of racing a toast's lifetime |
+
+### Error format
+
+Every tool catches its own failures and returns `ERROR code=<CODE> msg=<detail>`
+instead of raising — `code` is one of `TIMEOUT`, `CONNECTION_LOST`,
+`NAVIGATED_DURING_EXECUTION`, `JS_EXCEPTION`, `STALE_REF`,
+`ELEMENT_NOT_VISIBLE`, `ELEMENT_GONE`, `BROWSER_NOT_STARTED`, `CDP_ERROR`,
+`BAD_ARGUMENT`. A `TIMEOUT` never comes back as a blank message.
+
+### `@eN` refs are single-use per snapshot
+
+Every action tool returns a fresh snapshot with new `@eN` refs — always use
+the refs from the MOST RECENT snapshot. A ref from an older snapshot raises
+`STALE_REF` rather than silently resolving to a different element.
+
+### `navigate` always destroys `window` state
+
+`navigate` is a full page load (like typing a URL and pressing Enter) — any
+variable/function you defined via `js_eval` is gone afterward. The tool
+reports `reloaded=true|false` on every call so you know when this happened;
+use `inject_persistent` for helpers that need to survive it.
+
+### Raw text alongside the accessible name
+
+A control's accessible name (what `snapshot` shows in `"..."`) is the browser's
+computed fusion of its `<label>`/`aria-label`/`aria-labelledby` — not
+necessarily what a plain DOM read of the element shows. When they differ,
+`snapshot` prints both: `button "CONDUCTOR" (txt: "Selecciona un conductor")`.
+No extra CDP calls — the raw text comes from `StaticText` descendants already
+present in the accessibility tree.
+
+### Popup / dropdown resolution
+
+Any dropdown, combobox, or menu that renders as a child of `<body>` (React
+portals, Vue teleports, a plain absolutely-positioned `<div>`) can end up
+sharing the DOM with unrelated background content that happens to have the
+same role/text — a naive "find the option with this text" click can land on
+the wrong element with no visible error. `snapshot` now marks the subtree of
+the currently-open popup with `[POPUP-ABIERTO]` (resolved from
+`aria-expanded`/`aria-controls`, zero extra CDP calls — it's already in the
+accessibility tree every snapshot fetches). Prefer `click_popup_option(text)`
+over clicking a raw `@eN` for a dropdown option: it resolves the open popup
+the same way and clicks inside exactly that subtree in one call, falling back
+to a JS-based visible-container search when the site has no ARIA wiring.
+
+### Transient UI feedback (toasts, inline errors) — `act_and_observe`
+
+A toast/snackbar/inline validation message can appear and disappear entirely
+within ~2.5-4s — shorter than the round-trip between one tool call that acts
+and a separate one that reads the result. `act_and_observe(action, ref=...,
+watch_ms=3000)` performs the action and watches the DOM (via the bootstrap's
+already-running MutationObserver — no installation delay) and the console
+buffer for `watch_ms`, returning a timeline of what appeared/disappeared and
+when, plus any new console output, in one call. For a suspected error after
+any action, check `console_delta` (or `read_console`) before the DOM — an
+error toast fades in seconds, but the `console.error` it usually also fires
+persists in the buffer far longer.
+
+### `click` vs `js_click`
+
+`click` dispatches real CDP mouse events only (matches what a user click
+fires, including React 17+ delegated handlers) — it does **not** also fire a
+JS `element.click()`, which would double-trigger the handler. Use `js_click`
+explicitly when CDP mouse events genuinely don't reach a handler.
 
 ---
 

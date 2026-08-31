@@ -7,16 +7,104 @@ CDP WebSocket survives across every tool call, eliminating per-command startup l
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 
 from ..actions import forms, keyboard, mouse
 from ..cdp.connection import CDPConnection
 from ..cdp.events import EventBuffers, NetEntry
+from ..errors import (
+    BadArgumentError,
+    BrowserNotStartedError,
+    CdpProtocolError,
+    ElementGoneError,
+    NavigatedDuringExecutionError,
+)
 from ..chrome import launcher, ws_url
 from ..config import Config
 from ..snapshot import collector
-from ..snapshot.refmap import RefMap
+from ..snapshot.filter import name_of, role_of
+from ..snapshot.refmap import RefEntry, RefMap
+from ..snapshot.serializer import resolve_open_popup_ids
 from . import waits
+from .inject import PersistentScripts
+
+
+_ACT_AND_OBSERVE_ACTIONS = frozenset(
+    {"click", "js_click", "fill", "press_key", "js", "popup_option"}
+)
+
+_POPUP_OPTION_ROLES = frozenset(
+    {"option", "menuitem", "menuitemcheckbox", "menuitemradio", "treeitem", "tab"}
+)
+
+
+def _find_text_match(nodes: list[dict], text: str, exact: bool) -> dict | None:
+    query = text.strip().lower()
+    for node in nodes:
+        candidate = name_of(node).strip().lower()
+        if (exact and candidate == query) or (not exact and query in candidate):
+            return node
+    return None
+
+
+# Tier 2/3 fallback for click_popup_option when no aria-controls relationship
+# exists: find the topmost visible listbox/menu/dialog (or the bootstrap's
+# last-inserted popup-like container as a last resort), then click a
+# text-matching item inside it via a plain JS element.click(). {query}/{exact}
+# are substituted with json.dumps'd/literal values, not raw string interpolation
+# of caller-controlled text without escaping.
+_POPUP_CLICK_JS_TEMPLATE = """
+(() => {{
+  function visible(el) {{
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+  }}
+  let containers = Array.from(document.querySelectorAll('[role=listbox],[role=menu],[role=dialog]'))
+    .filter(visible);
+  containers.sort((a, b) =>
+    (parseInt(getComputedStyle(b).zIndex) || 0) - (parseInt(getComputedStyle(a).zIndex) || 0)
+  );
+  let container = containers[0] || null;
+  if (!container && window.__fbm && window.__fbm.lastInsertedContainer &&
+      document.contains(window.__fbm.lastInsertedContainer)) {{
+    container = window.__fbm.lastInsertedContainer;
+  }}
+  if (!container) return {{clicked: false, options: []}};
+  const itemSel = '[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],li,button,a';
+  const items = Array.from(container.querySelectorAll(itemSel)).filter(visible);
+  const norm = (s) => (s || '').trim().toLowerCase();
+  const query = norm({query});
+  const exact = {exact};
+  const target = items.find((el) => exact ? norm(el.textContent) === query : norm(el.textContent).includes(query));
+  if (!target) return {{clicked: false, options: items.map((el) => el.textContent.trim())}};
+  target.click();
+  return {{clicked: true}};
+}})()
+"""
+
+
+def _extract_js_exception(exception_details: dict) -> str:
+    """Pull the actual JS error message out of a CDP exceptionDetails object.
+
+    ``exceptionDetails.text`` is almost always the useless literal "Uncaught"
+    — the real message (including the stack) lives on
+    ``exceptionDetails.exception.description`` for thrown Error objects, or
+    ``.value`` for a thrown primitive (string/number). Fall back through both
+    before resorting to ``.text`` or the raw dict.
+    """
+    exc = exception_details.get("exception") or {}
+    description = exc.get("description")
+    if description:
+        return str(description)
+    value = exc.get("value")
+    if value is not None:
+        return str(value)
+    text = exception_details.get("text")
+    if text:
+        return str(text)
+    return str(exception_details)
 
 
 class BrowserManager:
@@ -29,6 +117,8 @@ class BrowserManager:
         self._target_id: str | None = None
         self._child_sessions: list[str] = []
         self._refmap = RefMap()
+        self._warm_ax_sessions: set[str | None] = set()
+        self._injected = PersistentScripts()
         self._lock = asyncio.Lock()
 
     # --- lifecycle -----------------------------------------------------------
@@ -136,6 +226,11 @@ class BrowserManager:
         assert self._conn is not None
         for domain in ("Page", "DOM", "Runtime", "Network", "Log", "Accessibility"):
             await self._conn.call(f"{domain}.enable", session_id=self._session_id)
+        # Registrations from Page.addScriptToEvaluateOnNewDocument are scoped
+        # to the session/target they were made on; a cross-origin nav that
+        # swaps _session_id (see _on_attached) leaves the OLD registrations
+        # behind with the dead target, so every (re)enable reinstalls them.
+        await self._injected.install_all(self._conn, self._session_id)
 
     async def shutdown(self, kill: bool = False) -> dict:
         if self._conn is not None:
@@ -147,12 +242,49 @@ class BrowserManager:
         return {"status": "stopped", "killed": kill}
 
     # --- navigation + snapshot ----------------------------------------------
-    async def navigate(self, url: str, wait: str = "load") -> None:
+    async def _read_fbm_marker(self) -> float | None:
+        """Read window.__fbm.installedAt (the Date.now() timestamp of when the
+        bootstrap script last ran), or None if it hasn't run at all (blocked
+        by CSP, about:blank).
+
+        This — not the persisted `epoch` counter — is what detects an actual
+        reload: a genuine navigation always creates a brand-new `window`, so
+        the bootstrap re-runs and installedAt changes, unconditionally. The
+        `epoch` counter round-trips through localStorage instead, which is
+        the right signal for "how many reloads has this ORIGIN seen" but is
+        unreliable here: an opaque origin (e.g. a `data:` URL, a sandboxed
+        iframe) has no persistent storage across navigations, so epoch alone
+        would misreport a genuine reload as a same-document transition.
+        """
+        try:
+            res = await self._conn.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "window.__fbm ? window.__fbm.installedAt : null",
+                    "returnByValue": True,
+                },
+                session_id=self._session_id,
+            )
+            return (res.get("result") or {}).get("value")
+        except Exception:
+            return None
+
+    async def navigate(self, url: str, wait: str = "load") -> dict:
+        """Navigate to url. Returns {"reloaded": bool} — True if the target
+        document was actually torn down and recreated (the normal case for
+        Page.navigate: any window state / injected helpers the LLM defined
+        are gone), False for a same-document navigation (e.g. a hash change)
+        where the existing window survived. Unknown when the bootstrap script
+        couldn't run (about:blank, strict CSP) — reported as reloaded=True
+        since that's the safe assumption for "did I lose my state".
+        """
         conn = self._require_conn()
+        self._warm_ax_sessions.clear()
+        marker_before = await self._read_fbm_marker()
         try:
             await conn.call("Page.navigate", {"url": url}, session_id=self._session_id)
-        except RuntimeError as exc:
-            if "not found" in str(exc).lower() or "session" in str(exc).lower():
+        except CdpProtocolError as exc:
+            if "not found" in exc.message.lower() or "session" in exc.message.lower():
                 # Session went stale (e.g. Chrome closed/replaced the tab). Reattach.
                 await self._attach_to_page()
                 await self._enable_domains()
@@ -163,6 +295,9 @@ class BrowserManager:
             await waits.wait_load(conn, lambda: self._session_id)
         elif wait == "networkidle":
             await waits.wait_networkidle(conn, self._session_id)
+        marker_after = await self._read_fbm_marker()
+        reloaded = marker_before is None or marker_after is None or marker_after != marker_before
+        return {"reloaded": reloaded}
 
     async def snapshot(self, interactive_only: bool = True) -> dict:
         conn = self._require_conn()
@@ -172,6 +307,7 @@ class BrowserManager:
             self._session_id,
             child_sessions=self._child_sessions,
             interactive_only=interactive_only,
+            warm_sessions=self._warm_ax_sessions,
         )
         return {"snapshot_id": snap_id, "snapshot": text, "refs": len(self._refmap)}
 
@@ -183,15 +319,25 @@ class BrowserManager:
         return {"ok": True}
 
     # --- actions (all re-snapshot at the end to keep refs fresh) -------------
-    async def click(self, ref: str) -> dict:
+    # Each public action is a thin snapshot-returning wrapper over a private
+    # _do_* that performs ONLY the action. act_and_observe() calls the _do_*
+    # directly so it can watch for DOM/console changes across the wait window
+    # without paying for (and racing against) an intermediate snapshot.
+    async def _do_click(self, ref: str) -> None:
         conn = self._require_conn()
         await mouse.click(conn, self._refmap.resolve(ref), human=self.cfg.human_delays)
+
+    async def click(self, ref: str) -> dict:
+        await self._do_click(ref)
         return await self.snapshot()
+
+    async def _do_js_click(self, ref: str) -> None:
+        conn = self._require_conn()
+        await mouse.js_click(conn, self._refmap.resolve(ref))
 
     async def js_click(self, ref: str) -> dict:
         """JS element.click() — bypasses CDP mouse events, reliable for React SPAs."""
-        conn = self._require_conn()
-        await mouse.js_click(conn, self._refmap.resolve(ref))
+        await self._do_js_click(ref)
         return await self.snapshot()
 
     async def hover(self, ref: str) -> dict:
@@ -199,12 +345,15 @@ class BrowserManager:
         await mouse.hover(conn, self._refmap.resolve(ref))
         return await self.snapshot()
 
-    async def fill(self, ref: str, text: str, submit: bool = False) -> dict:
+    async def _do_fill(self, ref: str, text: str, submit: bool = False) -> None:
         conn = self._require_conn()
         await forms.fill(
             conn, self._refmap.resolve(ref), text,
             human=self.cfg.human_delays, submit=submit,
         )
+
+    async def fill(self, ref: str, text: str, submit: bool = False) -> dict:
+        await self._do_fill(ref, text, submit=submit)
         return await self.snapshot()
 
     async def select_option(self, ref: str, value: str | None = None, label: str | None = None) -> dict:
@@ -212,54 +361,97 @@ class BrowserManager:
         await forms.select_option(conn, self._refmap.resolve(ref), value=value, label=label)
         return await self.snapshot()
 
-    async def press_key(self, key: str, ref: str | None) -> dict:
+    async def _do_press_key(self, key: str, ref: str | None) -> None:
         conn = self._require_conn()
         sid = self._refmap.resolve(ref).session_id if ref else self._session_id
         await keyboard.press_key(conn, key, sid)
+
+    async def press_key(self, key: str, ref: str | None) -> dict:
+        await self._do_press_key(key, ref)
         return await self.snapshot()
 
     # --- js / cdp escape hatches ---------------------------------------------
-    async def js_eval(self, script: str, ref: str | None = None) -> dict:
-        """Execute arbitrary JS in the page context.
-
-        ref=None  → Runtime.evaluate(script)          (expression mode)
-        ref=@eN   → Runtime.callFunctionOn(script)     (function bound to element as `this`)
-
-        Returns {"js_result": <value>, "exception": <msg|None>} + snapshot fields.
-        awaitPromise=True so async scripts work; returnByValue serialises primitives/objects.
-        """
+    async def _do_js_eval(
+        self, script: str, ref: str | None, timeout_ms: int | None
+    ) -> tuple[object, str | None]:
+        """Run `script` and return (value, exception) — no closing snapshot."""
         conn = self._require_conn()
         exception = None
+        call_kwargs = {"timeout": timeout_ms / 1000.0} if timeout_ms else {}
 
         if ref is None:
             res = await conn.call(
                 "Runtime.evaluate",
                 {"expression": script, "returnByValue": True, "awaitPromise": True},
                 session_id=self._session_id,
+                **call_kwargs,
             )
             value = (res.get("result") or {}).get("value")
             if res.get("exceptionDetails"):
-                exception = str(res["exceptionDetails"].get("text") or res["exceptionDetails"])
-        else:
-            entry = self._refmap.resolve(ref)
-            obj = await conn.call(
-                "DOM.resolveNode", {"backendNodeId": entry.backend_node_id},
-                session_id=entry.session_id,
-            )
-            object_id = (obj.get("object") or {}).get("objectId")
-            res = await conn.call(
-                "Runtime.callFunctionOn",
-                {"objectId": object_id, "functionDeclaration": script,
-                 "returnByValue": True, "awaitPromise": True},
-                session_id=entry.session_id,
-            )
-            value = (res.get("result") or {}).get("value")
-            if res.get("exceptionDetails"):
-                exception = str(res["exceptionDetails"].get("text") or res["exceptionDetails"])
+                exception = _extract_js_exception(res["exceptionDetails"])
+            return value, exception
 
-        snap = await self.snapshot()
-        return {"js_result": value, "exception": exception,
-                "snapshot_id": snap["snapshot_id"], "snapshot": snap["snapshot"], "refs": snap["refs"]}
+        entry = self._refmap.resolve(ref)
+        obj = await conn.call(
+            "DOM.resolveNode", {"backendNodeId": entry.backend_node_id},
+            session_id=entry.session_id,
+        )
+        object_id = (obj.get("object") or {}).get("objectId")
+        if object_id is None:
+            raise ElementGoneError(
+                f"{ref} ya no resuelve a un nodo vivo (backend_node_id="
+                f"{entry.backend_node_id}). Vuelve a llamar snapshot."
+            )
+        res = await conn.call(
+            "Runtime.callFunctionOn",
+            {"objectId": object_id, "functionDeclaration": script,
+             "returnByValue": True, "awaitPromise": True},
+            session_id=entry.session_id,
+            **call_kwargs,
+        )
+        value = (res.get("result") or {}).get("value")
+        if res.get("exceptionDetails"):
+            exception = _extract_js_exception(res["exceptionDetails"])
+        return value, exception
+
+    async def js_eval(
+        self, script: str, ref: str | None = None, timeout_ms: int | None = None
+    ) -> dict:
+        """Execute arbitrary JS in the page context.
+
+        ref=None  → Runtime.evaluate(script)          (expression mode)
+        ref=@eN   → Runtime.callFunctionOn(script)     (function bound to element as `this`)
+
+        Returns {"js_result": <value>, "exception": <msg|None>,
+        "snapshot_error": <msg|None>} + snapshot fields.
+        awaitPromise=True so async scripts work; returnByValue serialises primitives/objects.
+
+        A TIMEOUT/NAVIGATED_DURING_EXECUTION from the eval call itself still
+        propagates (there is no partial js_result to salvage in that case).
+        But once the eval call has returned, the closing snapshot() is never
+        allowed to swallow that result: if the script navigated the page and
+        the snapshot fails, js_result/exception are still returned alongside a
+        snapshot_error, instead of the whole call raising and the caller
+        being unable to tell whether the script itself ran.
+        """
+        value, exception = await self._do_js_eval(script, ref, timeout_ms)
+
+        snapshot_error = None
+        snap = None
+        try:
+            snap = await self.snapshot()
+        except (NavigatedDuringExecutionError, CdpProtocolError) as exc:
+            snapshot_error = str(exc)
+
+        if snap is None:
+            return {
+                "js_result": value, "exception": exception, "snapshot_error": snapshot_error,
+                "snapshot_id": self._refmap.snapshot_id, "snapshot": "", "refs": 0,
+            }
+        return {
+            "js_result": value, "exception": exception, "snapshot_error": snapshot_error,
+            "snapshot_id": snap["snapshot_id"], "snapshot": snap["snapshot"], "refs": snap["refs"],
+        }
 
     async def cdp_call(self, method: str, params: dict | None = None, use_session: bool = True) -> dict:
         """Pass-through for any CDP domain.method call.
@@ -373,8 +565,10 @@ class BrowserManager:
         res = await conn.call("Page.captureScreenshot", params, session_id=self._session_id)
         return res.get("data", "")
 
-    def read_console(self, clear: bool = False) -> list[str]:
-        return self._events.read_console(clear) if self._events else []
+    def read_console(
+        self, clear: bool = False, level: str | None = None, since_ms: int | None = None
+    ) -> list[str]:
+        return self._events.read_console(clear, level=level, since_ms=since_ms) if self._events else []
 
     def read_network(self, filter_substr: str | None, clear: bool = False) -> list[NetEntry]:
         return self._events.read_network(filter_substr, clear) if self._events else []
@@ -382,10 +576,231 @@ class BrowserManager:
     async def current_url(self) -> dict:
         return {"url": await self._current_url(), "title": await self._title()}
 
+    # --- persistent (survives-navigation) helpers ----------------------------
+    async def inject_persistent(self, script: str, identifier: str) -> dict:
+        """Register `script` to re-run on every future document via
+        Page.addScriptToEvaluateOnNewDocument, then install it immediately in
+        the current document too (the registration only affects FUTURE
+        documents, not the one already loaded)."""
+        conn = self._require_conn()
+        self._injected.add(identifier, script)
+        await self._injected.install_all(conn, self._session_id)
+        try:
+            await conn.call(
+                "Runtime.evaluate", {"expression": script}, session_id=self._session_id
+            )
+        except Exception:
+            pass  # best-effort in the CURRENT document; it's live from the next one on
+        return {"identifier": identifier}
+
+    def list_persistent(self) -> list[str]:
+        return self._injected.list_ids()
+
+    def remove_persistent(self, identifier: str) -> bool:
+        return self._injected.remove(identifier)
+
+    # --- popup resolution ------------------------------------------------------
+    async def click_popup_option(self, text: str, exact: bool = False) -> dict:
+        await self._do_click_popup_option(text, exact)
+        return await self.snapshot()
+
+    async def _do_click_popup_option(self, text: str, exact: bool = False) -> None:
+        """Resolve the CURRENTLY OPEN dropdown/menu/listbox and click the option
+        matching `text` — no separate "read snapshot, guess which @eN is the
+        real popup vs. a same-text background element" round-trip.
+
+        Tier 1 (preferred): the AX tree's own aria-expanded/aria-controls
+        relationship — same resolution the snapshot annotation uses, so if a
+        line was marked [POPUP-ABIERTO] this will click inside exactly that
+        subtree via a real CDP mouse click.
+        Tier 2/3 fallback (sites with no aria-controls wiring): a JS-side
+        search for the topmost visible [role=listbox|menu|dialog], falling
+        back to the bootstrap's last-inserted popup-like container, then a
+        JS-side element.click() inside it — this ONE extra CDP round-trip is
+        only paid when tier 1 finds nothing, not on every snapshot.
+        """
+        conn = self._require_conn()
+        ax = await conn.call("Accessibility.getFullAXTree", session_id=self._session_id)
+        nodes = ax.get("nodes", [])
+        by_id = {n["nodeId"]: n for n in nodes}
+        popup_root_ids = resolve_open_popup_ids(nodes, by_id)
+
+        candidates: list[dict] = []
+
+        def collect(node_id: str) -> None:
+            node = by_id.get(node_id)
+            if node is None:
+                return
+            if role_of(node) in _POPUP_OPTION_ROLES:
+                candidates.append(node)
+            for cid in node.get("childIds") or []:
+                collect(cid)
+
+        for root_id in popup_root_ids:
+            collect(root_id)
+
+        target = _find_text_match(candidates, text, exact)
+        if target is not None:
+            entry = RefEntry(
+                ref="@popup",
+                backend_node_id=target["backendDOMNodeId"],
+                session_id=self._session_id,
+                role=role_of(target),
+                name=name_of(target),
+            )
+            await mouse.click(conn, entry, human=self.cfg.human_delays)
+            return
+
+        js_result = await self._click_popup_option_js(text, exact)
+        if js_result.get("clicked"):
+            return
+
+        available = js_result.get("options")
+        if available is None:
+            available = [name_of(n) for n in candidates]
+        raise BadArgumentError(
+            f"Ninguna opcion de popup coincide con {text!r}. Opciones visibles: {available}"
+        )
+
+    async def _click_popup_option_js(self, text: str, exact: bool) -> dict:
+        script = _POPUP_CLICK_JS_TEMPLATE.format(
+            query=json.dumps(text), exact="true" if exact else "false"
+        )
+        res = await self._require_conn().call(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": True},
+            session_id=self._session_id,
+        )
+        return (res.get("result") or {}).get("value") or {}
+
+    # --- act + observe ---------------------------------------------------------
+    async def act_and_observe(
+        self,
+        action: str,
+        ref: str | None = None,
+        text: str | None = None,
+        key: str | None = None,
+        script: str | None = None,
+        exact: bool = False,
+        watch_ms: int = 3000,
+    ) -> dict:
+        """Perform ONE action, then watch the page for `watch_ms` and report
+        what appeared/disappeared, in a single tool call.
+
+        Any transient UI feedback (a toast, a snackbar, an inline validation
+        message) that appears and disappears on its own is a universal
+        pattern — the problem is timing: if "act" and "read the result" are
+        two separate tool calls, the round-trip between them can outlast the
+        message's whole lifetime (as short as ~2.5-4s in practice). This
+        reuses the bootstrap's MutationObserver (already running from before
+        the action, via Page.addScriptToEvaluateOnNewDocument — see inject.py)
+        instead of installing one at action time, which would miss anything
+        that lands in the first tens of milliseconds after the click.
+
+        action — one of: click, js_click, fill, press_key, js, popup_option.
+        Returns {"action_error", "timeline", "console_delta", + snapshot fields}.
+        """
+        if action not in _ACT_AND_OBSERVE_ACTIONS:
+            raise BadArgumentError(
+                f"action={action!r} desconocida. Usa: {', '.join(sorted(_ACT_AND_OBSERVE_ACTIONS))}."
+            )
+
+        conn = self._require_conn()
+        mark = await conn.call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "({markTime: Date.now(), "
+                    "cursor: (window.__fbm ? window.__fbm.mutations.length : 0)})"
+                ),
+                "returnByValue": True,
+            },
+            session_id=self._session_id,
+        )
+        mark_value = (mark.get("result") or {}).get("value") or {"markTime": 0, "cursor": 0}
+
+        action_error = None
+        try:
+            await self._dispatch_action(
+                action, ref=ref, text=text, key=key, script=script, exact=exact
+            )
+        except Exception as exc:
+            # An action failure is itself something worth reporting alongside
+            # whatever DID happen in the watch window — not a reason to abort
+            # before observing (e.g. a click that hit a stale ref might still
+            # have been preceded by a mutation worth seeing).
+            action_error = str(exc)
+
+        await asyncio.sleep(watch_ms / 1000.0)
+
+        timeline = await self._read_mutation_timeline(mark_value["cursor"], mark_value["markTime"])
+        console_delta = self.read_console(since_ms=watch_ms + 500)
+        snap = await self.snapshot()
+        return {
+            "action_error": action_error,
+            "timeline": timeline,
+            "console_delta": console_delta,
+            "snapshot_id": snap["snapshot_id"],
+            "snapshot": snap["snapshot"],
+            "refs": snap["refs"],
+        }
+
+    async def _dispatch_action(
+        self,
+        action: str,
+        *,
+        ref: str | None,
+        text: str | None,
+        key: str | None,
+        script: str | None,
+        exact: bool,
+    ) -> None:
+        if action == "click":
+            await self._do_click(ref)
+        elif action == "js_click":
+            await self._do_js_click(ref)
+        elif action == "fill":
+            await self._do_fill(ref, text or "")
+        elif action == "press_key":
+            await self._do_press_key(key or "", ref)
+        elif action == "js":
+            await self._do_js_eval(script or "", ref, None)
+        elif action == "popup_option":
+            await self._do_click_popup_option(text or "", exact)
+
+    async def _read_mutation_timeline(self, cursor: int, mark_time: float) -> list[str]:
+        conn = self._require_conn()
+        try:
+            res = await conn.call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "window.__fbm ? window.__fbm.mutations.slice(" + str(int(cursor)) + ") : []"
+                    ),
+                    "returnByValue": True,
+                },
+                session_id=self._session_id,
+            )
+        except Exception:
+            return []
+        entries = (res.get("result") or {}).get("value") or []
+        lines = []
+        for entry in entries:
+            offset_ms = int(entry.get("t", mark_time) - mark_time)
+            node = entry.get("node") or {}
+            desc = node.get("tag") or "?"
+            if node.get("role"):
+                desc += f"[role={node['role']}]"
+            if node.get("text"):
+                desc += f' "{node["text"]}"'
+            symbol = {"added": "+", "removed": "-"}.get(entry.get("kind"), "~")
+            lines.append(f"+{offset_ms}ms {symbol} {desc}")
+        return lines
+
     # --- helpers -------------------------------------------------------------
     def _require_conn(self) -> CDPConnection:
         if self._conn is None or not self._conn.is_connected:
-            raise RuntimeError("BROWSER_NOT_STARTED: llama browser_start primero.")
+            raise BrowserNotStartedError("Llama browser_start primero.")
         return self._conn
 
     async def _current_url(self) -> str:

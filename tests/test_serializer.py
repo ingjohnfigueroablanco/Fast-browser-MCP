@@ -64,3 +64,73 @@ def test_long_static_text_is_truncated():
     text = serialize(nodes, rm, interactive_only=False)
     assert "…" in text
     assert len(text) < 200
+
+
+def test_raw_text_shown_when_it_differs_from_accessible_name():
+    # A button labelled "CONDUCTOR" by an associated <label>, but whose own
+    # visible text is a placeholder — the accessible name (what `name_of`
+    # reports) is what shows up in "..."; the raw StaticText child should
+    # appear separately since it's genuinely different.
+    rm = RefMap()
+    nodes = [
+        _node("1", "WebArea", "", 1, children=["2"]),
+        _node("2", "button", "CONDUCTOR", 2, children=["3"]),
+        _node("3", "StaticText", "Selecciona un conductor", 3),
+    ]
+    text = serialize(nodes, rm, interactive_only=True)
+    assert '"CONDUCTOR"' in text
+    assert '(txt: "Selecciona un conductor")' in text
+
+
+def test_raw_text_hidden_when_it_matches_accessible_name():
+    rm = RefMap()
+    nodes = [
+        _node("1", "WebArea", "", 1, children=["2"]),
+        _node("2", "button", "Entrar", 2, children=["3"]),
+        _node("3", "StaticText", "Entrar", 3),
+    ]
+    text = serialize(nodes, rm, interactive_only=True)
+    assert "(txt:" not in text
+
+
+def _with_controls(node_id, role, name, backend, controls_backend_ids, expanded=True):
+    return _node(
+        node_id, role, name, backend,
+        props=[
+            {"name": "expanded", "value": {"value": expanded}},
+            {
+                "name": "controls",
+                "value": {"relatedNodes": [{"backendDOMNodeId": cid} for cid in controls_backend_ids]},
+            },
+        ],
+    )
+
+
+def test_open_popup_is_annotated_and_background_lookalike_is_not():
+    # A combobox with aria-expanded=true / aria-controls pointing at a real
+    # listbox that lives as a DIRECT CHILD OF THE ROOT (the universal "portal
+    # to body" pattern) — plus an unrelated background option with the exact
+    # same text, which must NOT get the marker.
+    rm = RefMap()
+    nodes = [
+        _node("1", "WebArea", "", 1, children=["2", "3", "6"]),
+        _with_controls("2", "combobox", "Conductor", 2, controls_backend_ids=[30]),
+        _node("3", "listbox", "", 30, children=["4", "5"]),  # the REAL open popup
+        _node("4", "option", "Juan Perez", 31),
+        _node("5", "option", "Ana Gomez", 32),
+        _node("6", "option", "Juan Perez", 33),  # unrelated background lookalike
+    ]
+    text = serialize(nodes, rm, interactive_only=True)
+    lines = text.splitlines()
+
+    # The marker is placed ONLY on the resolved popup root (the listbox),
+    # never on its option children or on the unrelated background lookalike.
+    marked_lines = [line for line in lines if "[POPUP-ABIERTO]" in line]
+    assert len(marked_lines) == 1
+    assert "listbox" in marked_lines[0]
+
+    background_line = next(
+        line for line in lines
+        if line.strip().startswith("@") and rm.resolve(line.split()[0]).backend_node_id == 33
+    )
+    assert "[POPUP-ABIERTO]" not in background_line

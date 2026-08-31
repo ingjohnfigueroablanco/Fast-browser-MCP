@@ -59,11 +59,14 @@ async def test_navigate_snapshot_click_fill():
         assert "button" in snap["snapshot"]
         assert snap["refs"] >= 2
 
-        # Find the textbox and button refs from the snapshot text.
+        # Find the textbox ref from the snapshot text.
         email_ref = _ref_for(snap["snapshot"], "textbox")
-        button_ref = _ref_for(snap["snapshot"], "button")
 
-        await mgr.fill(email_ref, "qa@example.com")
+        # fill() re-snapshots internally, so refs from the pre-fill snapshot
+        # (like a button ref grabbed here) are a DIFFERENT generation by the
+        # time click() runs — re-read the button ref from fill's own result.
+        after_fill = await mgr.fill(email_ref, "qa@example.com")
+        button_ref = _ref_for(after_fill["snapshot"], "button")
         await mgr.click(button_ref)
 
         out = await mgr.get_text(None)

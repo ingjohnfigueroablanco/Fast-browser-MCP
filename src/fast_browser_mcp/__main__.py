@@ -96,6 +96,22 @@ def _run_sse(mcp, host: str, port: int) -> None:
     import uvicorn
 
     api_key = os.getenv("MCP_API_KEY", "")
+
+    ts = getattr(mcp.settings, "transport_security", None)
+    if ts is not None:
+        # FastMCP's own defaults already allow 127.0.0.1/localhost/[::1] on
+        # any port — host.docker.internal (how the container's host machine
+        # reaches it) is just missing from that allowlist, so add it the same
+        # way instead of disabling DNS rebinding protection outright (which
+        # would open the SSE endpoint, default host 0.0.0.0, to rebinding
+        # attacks from ANY origin, not just Docker's internal host).
+        ts.allowed_hosts = list(dict.fromkeys([*ts.allowed_hosts, "host.docker.internal:*"]))
+        # allowed_origins only matters for requests that DO send an Origin
+        # header (absent Origin always passes, e.g. a bare SSE client).
+        ts.allowed_origins = list(
+            dict.fromkeys([*ts.allowed_origins, "http://host.docker.internal:*"])
+        )
+
     app = mcp.sse_app()
 
     # Wrap with pure-ASGI middlewares (innermost first)

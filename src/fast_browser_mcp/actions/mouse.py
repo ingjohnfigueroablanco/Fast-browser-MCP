@@ -17,10 +17,14 @@ async def _delay(window: tuple[float, float], human: bool) -> None:
 
 
 async def click(conn: CDPConnection, entry: RefEntry, human: bool = True) -> None:
-    """Click an element. Moves mouse to coords then dispatches mousedown/up/click.
+    """Click an element via real CDP Input events (mousemove/down/up).
 
-    React 17+ delegates synthetic events to the root container. We dispatch CDP
-    mouse events AND a JS dispatchEvent click so React event handlers always fire.
+    This dispatches ONLY the CDP mouse sequence — no follow-up JS click. A
+    genuine click already fires everything a real user click fires (including
+    React 17+ delegated handlers); adding a JS `element.click()` on top double-
+    fires any handler bound to the click event (double form submit, duplicate
+    row creation). Use the separate `js_click` tool when CDP mouse events truly
+    don't reach a handler.
     """
     x, y = await center_of(conn, entry)
     sid = entry.session_id
@@ -38,8 +42,6 @@ async def click(conn: CDPConnection, entry: RefEntry, human: bool = True) -> Non
         {**base, "type": "mouseReleased", "button": "left", "clickCount": 1},
         sid,
     )
-    # Dispatch a synthetic JS click so React 17+ delegation also fires.
-    await js_click(conn, entry)
 
 
 async def js_click(conn: CDPConnection, entry: RefEntry) -> None:

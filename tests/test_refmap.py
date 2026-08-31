@@ -32,6 +32,22 @@ def test_resolve_unknown_ref_raises():
         rm.resolve("@e99")
 
 
+def test_stale_ref_from_previous_generation_does_not_resolve_to_wrong_node():
+    """A ref valid in generation N must not silently match a same-named ref
+    assigned in generation N+1 — it should raise StaleRefError instead of
+    resolving to whatever node happens to get that ref string next."""
+    rm = RefMap()
+    rm.begin()
+    old_ref = rm.assign(backend_node_id=1, role="button", name="Old target")
+    rm.begin()
+    # New generation reuses the same DOM but the LLM held on to `old_ref`
+    # from before the click that re-rendered the page.
+    rm.assign(backend_node_id=2, role="button", name="New target")
+    rm.assign(backend_node_id=3, role="button", name="Another target")
+    with pytest.raises(StaleRefError):
+        rm.resolve(old_ref)
+
+
 def test_current_session_applied_when_not_overridden():
     rm = RefMap()
     rm.begin()
