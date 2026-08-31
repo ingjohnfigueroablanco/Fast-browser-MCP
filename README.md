@@ -131,6 +131,7 @@ The browser runs **inside the container**. `localhost` inside Docker ≠ your de
 | `inject_persistent` | Register a JS helper that survives `navigate()` (a full reload otherwise wipes `window`) |
 | `list_persistent` | List identifiers of registered persistent scripts |
 | `remove_persistent` | Remove a persistent script by identifier |
+| `click_popup_option` | Resolve the currently-open dropdown/menu/listbox and click the matching option, in one call |
 
 ### Error format
 
@@ -152,6 +153,29 @@ the refs from the MOST RECENT snapshot. A ref from an older snapshot raises
 variable/function you defined via `js_eval` is gone afterward. The tool
 reports `reloaded=true|false` on every call so you know when this happened;
 use `inject_persistent` for helpers that need to survive it.
+
+### Raw text alongside the accessible name
+
+A control's accessible name (what `snapshot` shows in `"..."`) is the browser's
+computed fusion of its `<label>`/`aria-label`/`aria-labelledby` — not
+necessarily what a plain DOM read of the element shows. When they differ,
+`snapshot` prints both: `button "CONDUCTOR" (txt: "Selecciona un conductor")`.
+No extra CDP calls — the raw text comes from `StaticText` descendants already
+present in the accessibility tree.
+
+### Popup / dropdown resolution
+
+Any dropdown, combobox, or menu that renders as a child of `<body>` (React
+portals, Vue teleports, a plain absolutely-positioned `<div>`) can end up
+sharing the DOM with unrelated background content that happens to have the
+same role/text — a naive "find the option with this text" click can land on
+the wrong element with no visible error. `snapshot` now marks the subtree of
+the currently-open popup with `[POPUP-ABIERTO]` (resolved from
+`aria-expanded`/`aria-controls`, zero extra CDP calls — it's already in the
+accessibility tree every snapshot fetches). Prefer `click_popup_option(text)`
+over clicking a raw `@eN` for a dropdown option: it resolves the open popup
+the same way and clicks inside exactly that subtree in one call, falling back
+to a JS-based visible-container search when the site has no ARIA wiring.
 
 ### `click` vs `js_click`
 

@@ -460,3 +460,23 @@ async def remove_persistent(identifier: str) -> str:
     """Elimina un script persistente por su identifier."""
     removed = get_browser().remove_persistent(identifier)
     return json.dumps({"removed": removed}, ensure_ascii=False)
+
+
+@mcp.tool()
+@tool_errors
+async def click_popup_option(text: str, exact: bool = False) -> str:
+    """Resuelve el dropdown/menu/listbox ACTUALMENTE ABIERTO y hace click en la
+    opcion que coincide con `text`, en una sola llamada.
+
+    Evita el error comun de hacer click en un elemento de FONDO que casualmente
+    tiene el mismo texto/role que la opcion real del popup (patron universal:
+    cualquier dropdown/portal renderizado como hijo de <body> puede convivir en
+    el DOM con otro contenido que comparte texto/role por casualidad).
+
+    exact=False (default) — coincidencia por substring, case-insensitive.
+    exact=True — coincidencia exacta.
+
+    Si ninguna opcion coincide, falla con ERROR code=BAD_ARGUMENT listando las
+    opciones visibles encontradas, para que puedas reintentar con el texto correcto.
+    """
+    return _format_snapshot(await get_browser().click_popup_option(text, exact=exact))

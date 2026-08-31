@@ -7,18 +7,78 @@ CDP WebSocket survives across every tool call, eliminating per-command startup l
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 
 from ..actions import forms, keyboard, mouse
 from ..cdp.connection import CDPConnection
 from ..cdp.events import EventBuffers, NetEntry
-from ..errors import BrowserNotStartedError, CdpProtocolError, ElementGoneError, NavigatedDuringExecutionError
+from ..errors import (
+    BadArgumentError,
+    BrowserNotStartedError,
+    CdpProtocolError,
+    ElementGoneError,
+    NavigatedDuringExecutionError,
+)
 from ..chrome import launcher, ws_url
 from ..config import Config
 from ..snapshot import collector
-from ..snapshot.refmap import RefMap
+from ..snapshot.filter import name_of, role_of
+from ..snapshot.refmap import RefEntry, RefMap
+from ..snapshot.serializer import resolve_open_popup_ids
 from . import waits
 from .inject import PersistentScripts
+
+
+_POPUP_OPTION_ROLES = frozenset(
+    {"option", "menuitem", "menuitemcheckbox", "menuitemradio", "treeitem", "tab"}
+)
+
+
+def _find_text_match(nodes: list[dict], text: str, exact: bool) -> dict | None:
+    query = text.strip().lower()
+    for node in nodes:
+        candidate = name_of(node).strip().lower()
+        if (exact and candidate == query) or (not exact and query in candidate):
+            return node
+    return None
+
+
+# Tier 2/3 fallback for click_popup_option when no aria-controls relationship
+# exists: find the topmost visible listbox/menu/dialog (or the bootstrap's
+# last-inserted popup-like container as a last resort), then click a
+# text-matching item inside it via a plain JS element.click(). {query}/{exact}
+# are substituted with json.dumps'd/literal values, not raw string interpolation
+# of caller-controlled text without escaping.
+_POPUP_CLICK_JS_TEMPLATE = """
+(() => {{
+  function visible(el) {{
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+  }}
+  let containers = Array.from(document.querySelectorAll('[role=listbox],[role=menu],[role=dialog]'))
+    .filter(visible);
+  containers.sort((a, b) =>
+    (parseInt(getComputedStyle(b).zIndex) || 0) - (parseInt(getComputedStyle(a).zIndex) || 0)
+  );
+  let container = containers[0] || null;
+  if (!container && window.__fbm && window.__fbm.lastInsertedContainer &&
+      document.contains(window.__fbm.lastInsertedContainer)) {{
+    container = window.__fbm.lastInsertedContainer;
+  }}
+  if (!container) return {{clicked: false, options: []}};
+  const itemSel = '[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],li,button,a';
+  const items = Array.from(container.querySelectorAll(itemSel)).filter(visible);
+  const norm = (s) => (s || '').trim().toLowerCase();
+  const query = norm({query});
+  const exact = {exact};
+  const target = items.find((el) => exact ? norm(el.textContent) === query : norm(el.textContent).includes(query));
+  if (!target) return {{clicked: false, options: items.map((el) => el.textContent.trim())}};
+  target.click();
+  return {{clicked: true}};
+}})()
+"""
 
 
 def _extract_js_exception(exception_details: dict) -> str:
@@ -510,6 +570,76 @@ class BrowserManager:
 
     def remove_persistent(self, identifier: str) -> bool:
         return self._injected.remove(identifier)
+
+    # --- popup resolution ------------------------------------------------------
+    async def click_popup_option(self, text: str, exact: bool = False) -> dict:
+        """Resolve the CURRENTLY OPEN dropdown/menu/listbox and click the option
+        matching `text`, in one call — no separate "read snapshot, guess which
+        @eN is the real popup vs. a same-text background element" round-trip.
+
+        Tier 1 (preferred): the AX tree's own aria-expanded/aria-controls
+        relationship — same resolution the snapshot annotation uses, so if a
+        line was marked [POPUP-ABIERTO] this will click inside exactly that
+        subtree via a real CDP mouse click.
+        Tier 2/3 fallback (sites with no aria-controls wiring): a JS-side
+        search for the topmost visible [role=listbox|menu|dialog], falling
+        back to the bootstrap's last-inserted popup-like container, then a
+        JS-side element.click() inside it — this ONE extra CDP round-trip is
+        only paid when tier 1 finds nothing, not on every snapshot.
+        """
+        conn = self._require_conn()
+        ax = await conn.call("Accessibility.getFullAXTree", session_id=self._session_id)
+        nodes = ax.get("nodes", [])
+        by_id = {n["nodeId"]: n for n in nodes}
+        popup_root_ids = resolve_open_popup_ids(nodes, by_id)
+
+        candidates: list[dict] = []
+
+        def collect(node_id: str) -> None:
+            node = by_id.get(node_id)
+            if node is None:
+                return
+            if role_of(node) in _POPUP_OPTION_ROLES:
+                candidates.append(node)
+            for cid in node.get("childIds") or []:
+                collect(cid)
+
+        for root_id in popup_root_ids:
+            collect(root_id)
+
+        target = _find_text_match(candidates, text, exact)
+        if target is not None:
+            entry = RefEntry(
+                ref="@popup",
+                backend_node_id=target["backendDOMNodeId"],
+                session_id=self._session_id,
+                role=role_of(target),
+                name=name_of(target),
+            )
+            await mouse.click(conn, entry, human=self.cfg.human_delays)
+            return await self.snapshot()
+
+        js_result = await self._click_popup_option_js(text, exact)
+        if js_result.get("clicked"):
+            return await self.snapshot()
+
+        available = js_result.get("options")
+        if available is None:
+            available = [name_of(n) for n in candidates]
+        raise BadArgumentError(
+            f"Ninguna opcion de popup coincide con {text!r}. Opciones visibles: {available}"
+        )
+
+    async def _click_popup_option_js(self, text: str, exact: bool) -> dict:
+        script = _POPUP_CLICK_JS_TEMPLATE.format(
+            query=json.dumps(text), exact="true" if exact else "false"
+        )
+        res = await self._require_conn().call(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": True},
+            session_id=self._session_id,
+        )
+        return (res.get("result") or {}).get("value") or {}
 
     # --- helpers -------------------------------------------------------------
     def _require_conn(self) -> CDPConnection:
