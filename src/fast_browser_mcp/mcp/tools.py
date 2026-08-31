@@ -480,3 +480,57 @@ async def click_popup_option(text: str, exact: bool = False) -> str:
     opciones visibles encontradas, para que puedas reintentar con el texto correcto.
     """
     return _format_snapshot(await get_browser().click_popup_option(text, exact=exact))
+
+
+@mcp.tool()
+@tool_errors
+async def act_and_observe(
+    action: str,
+    ref: str | None = None,
+    text: str | None = None,
+    key: str | None = None,
+    script: str | None = None,
+    exact: bool = False,
+    watch_ms: int = 3000,
+) -> str:
+    """Ejecuta UNA accion y observa la pagina durante watch_ms, en una sola
+    llamada — resuelve el problema de que un toast/snackbar/mensaje de
+    validacion aparezca y desaparezca ANTES de que una llamada separada de
+    lectura alcance a verlo (ventana tipica: 2.5-4s).
+
+    action — uno de: "click", "js_click", "fill", "press_key", "js", "popup_option".
+      click/js_click   — usa `ref`.
+      fill             — usa `ref` + `text`.
+      press_key        — usa `key` (+ `ref` opcional para enfocar antes).
+      js               — usa `script` (+ `ref` opcional, igual que js_eval).
+      popup_option     — usa `text` (+ `exact`), igual que click_popup_option.
+
+    Devuelve:
+      - timeline: mutaciones DOM detectadas durante watch_ms, con offset en ms
+        desde el momento justo antes de la accion (ej: "+180ms + div[role=alert]
+        'Conductor asignado'", "+2600ms - div[role=alert]").
+      - console_delta: mensajes de consola nuevos durante la ventana (revisa esto
+        ante cualquier sospecha de error — dura mas que un toast en el DOM).
+      - snapshot fresco al final.
+
+    Ejemplo:
+      act_and_observe(action="click", ref="@e12", watch_ms=3000)
+    """
+    result = await get_browser().act_and_observe(
+        action, ref=ref, text=text, key=key, script=script, exact=exact, watch_ms=watch_ms
+    )
+    lines = []
+    if result["action_error"]:
+        lines.append(f"action_error={result['action_error']}")
+    lines.append("timeline:")
+    if result["timeline"]:
+        lines.extend(f"  {line}" for line in result["timeline"])
+    else:
+        lines.append("  (sin cambios en el DOM)")
+    lines.append("console_delta:")
+    if result["console_delta"]:
+        lines.extend(f"  {line}" for line in result["console_delta"])
+    else:
+        lines.append("  (sin mensajes)")
+    lines.append(_format_snapshot(result))
+    return "\n".join(lines)

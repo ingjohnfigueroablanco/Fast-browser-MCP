@@ -30,6 +30,10 @@ from . import waits
 from .inject import PersistentScripts
 
 
+_ACT_AND_OBSERVE_ACTIONS = frozenset(
+    {"click", "js_click", "fill", "press_key", "js", "popup_option"}
+)
+
 _POPUP_OPTION_ROLES = frozenset(
     {"option", "menuitem", "menuitemcheckbox", "menuitemradio", "treeitem", "tab"}
 )
@@ -315,15 +319,25 @@ class BrowserManager:
         return {"ok": True}
 
     # --- actions (all re-snapshot at the end to keep refs fresh) -------------
-    async def click(self, ref: str) -> dict:
+    # Each public action is a thin snapshot-returning wrapper over a private
+    # _do_* that performs ONLY the action. act_and_observe() calls the _do_*
+    # directly so it can watch for DOM/console changes across the wait window
+    # without paying for (and racing against) an intermediate snapshot.
+    async def _do_click(self, ref: str) -> None:
         conn = self._require_conn()
         await mouse.click(conn, self._refmap.resolve(ref), human=self.cfg.human_delays)
+
+    async def click(self, ref: str) -> dict:
+        await self._do_click(ref)
         return await self.snapshot()
+
+    async def _do_js_click(self, ref: str) -> None:
+        conn = self._require_conn()
+        await mouse.js_click(conn, self._refmap.resolve(ref))
 
     async def js_click(self, ref: str) -> dict:
         """JS element.click() — bypasses CDP mouse events, reliable for React SPAs."""
-        conn = self._require_conn()
-        await mouse.js_click(conn, self._refmap.resolve(ref))
+        await self._do_js_click(ref)
         return await self.snapshot()
 
     async def hover(self, ref: str) -> dict:
@@ -331,12 +345,15 @@ class BrowserManager:
         await mouse.hover(conn, self._refmap.resolve(ref))
         return await self.snapshot()
 
-    async def fill(self, ref: str, text: str, submit: bool = False) -> dict:
+    async def _do_fill(self, ref: str, text: str, submit: bool = False) -> None:
         conn = self._require_conn()
         await forms.fill(
             conn, self._refmap.resolve(ref), text,
             human=self.cfg.human_delays, submit=submit,
         )
+
+    async def fill(self, ref: str, text: str, submit: bool = False) -> dict:
+        await self._do_fill(ref, text, submit=submit)
         return await self.snapshot()
 
     async def select_option(self, ref: str, value: str | None = None, label: str | None = None) -> dict:
@@ -344,13 +361,59 @@ class BrowserManager:
         await forms.select_option(conn, self._refmap.resolve(ref), value=value, label=label)
         return await self.snapshot()
 
-    async def press_key(self, key: str, ref: str | None) -> dict:
+    async def _do_press_key(self, key: str, ref: str | None) -> None:
         conn = self._require_conn()
         sid = self._refmap.resolve(ref).session_id if ref else self._session_id
         await keyboard.press_key(conn, key, sid)
+
+    async def press_key(self, key: str, ref: str | None) -> dict:
+        await self._do_press_key(key, ref)
         return await self.snapshot()
 
     # --- js / cdp escape hatches ---------------------------------------------
+    async def _do_js_eval(
+        self, script: str, ref: str | None, timeout_ms: int | None
+    ) -> tuple[object, str | None]:
+        """Run `script` and return (value, exception) — no closing snapshot."""
+        conn = self._require_conn()
+        exception = None
+        call_kwargs = {"timeout": timeout_ms / 1000.0} if timeout_ms else {}
+
+        if ref is None:
+            res = await conn.call(
+                "Runtime.evaluate",
+                {"expression": script, "returnByValue": True, "awaitPromise": True},
+                session_id=self._session_id,
+                **call_kwargs,
+            )
+            value = (res.get("result") or {}).get("value")
+            if res.get("exceptionDetails"):
+                exception = _extract_js_exception(res["exceptionDetails"])
+            return value, exception
+
+        entry = self._refmap.resolve(ref)
+        obj = await conn.call(
+            "DOM.resolveNode", {"backendNodeId": entry.backend_node_id},
+            session_id=entry.session_id,
+        )
+        object_id = (obj.get("object") or {}).get("objectId")
+        if object_id is None:
+            raise ElementGoneError(
+                f"{ref} ya no resuelve a un nodo vivo (backend_node_id="
+                f"{entry.backend_node_id}). Vuelve a llamar snapshot."
+            )
+        res = await conn.call(
+            "Runtime.callFunctionOn",
+            {"objectId": object_id, "functionDeclaration": script,
+             "returnByValue": True, "awaitPromise": True},
+            session_id=entry.session_id,
+            **call_kwargs,
+        )
+        value = (res.get("result") or {}).get("value")
+        if res.get("exceptionDetails"):
+            exception = _extract_js_exception(res["exceptionDetails"])
+        return value, exception
+
     async def js_eval(
         self, script: str, ref: str | None = None, timeout_ms: int | None = None
     ) -> dict:
@@ -371,42 +434,7 @@ class BrowserManager:
         snapshot_error, instead of the whole call raising and the caller
         being unable to tell whether the script itself ran.
         """
-        conn = self._require_conn()
-        exception = None
-        call_kwargs = {"timeout": timeout_ms / 1000.0} if timeout_ms else {}
-
-        if ref is None:
-            res = await conn.call(
-                "Runtime.evaluate",
-                {"expression": script, "returnByValue": True, "awaitPromise": True},
-                session_id=self._session_id,
-                **call_kwargs,
-            )
-            value = (res.get("result") or {}).get("value")
-            if res.get("exceptionDetails"):
-                exception = _extract_js_exception(res["exceptionDetails"])
-        else:
-            entry = self._refmap.resolve(ref)
-            obj = await conn.call(
-                "DOM.resolveNode", {"backendNodeId": entry.backend_node_id},
-                session_id=entry.session_id,
-            )
-            object_id = (obj.get("object") or {}).get("objectId")
-            if object_id is None:
-                raise ElementGoneError(
-                    f"{ref} ya no resuelve a un nodo vivo (backend_node_id="
-                    f"{entry.backend_node_id}). Vuelve a llamar snapshot."
-                )
-            res = await conn.call(
-                "Runtime.callFunctionOn",
-                {"objectId": object_id, "functionDeclaration": script,
-                 "returnByValue": True, "awaitPromise": True},
-                session_id=entry.session_id,
-                **call_kwargs,
-            )
-            value = (res.get("result") or {}).get("value")
-            if res.get("exceptionDetails"):
-                exception = _extract_js_exception(res["exceptionDetails"])
+        value, exception = await self._do_js_eval(script, ref, timeout_ms)
 
         snapshot_error = None
         snap = None
@@ -573,9 +601,13 @@ class BrowserManager:
 
     # --- popup resolution ------------------------------------------------------
     async def click_popup_option(self, text: str, exact: bool = False) -> dict:
+        await self._do_click_popup_option(text, exact)
+        return await self.snapshot()
+
+    async def _do_click_popup_option(self, text: str, exact: bool = False) -> None:
         """Resolve the CURRENTLY OPEN dropdown/menu/listbox and click the option
-        matching `text`, in one call — no separate "read snapshot, guess which
-        @eN is the real popup vs. a same-text background element" round-trip.
+        matching `text` — no separate "read snapshot, guess which @eN is the
+        real popup vs. a same-text background element" round-trip.
 
         Tier 1 (preferred): the AX tree's own aria-expanded/aria-controls
         relationship — same resolution the snapshot annotation uses, so if a
@@ -617,11 +649,11 @@ class BrowserManager:
                 name=name_of(target),
             )
             await mouse.click(conn, entry, human=self.cfg.human_delays)
-            return await self.snapshot()
+            return
 
         js_result = await self._click_popup_option_js(text, exact)
         if js_result.get("clicked"):
-            return await self.snapshot()
+            return
 
         available = js_result.get("options")
         if available is None:
@@ -640,6 +672,130 @@ class BrowserManager:
             session_id=self._session_id,
         )
         return (res.get("result") or {}).get("value") or {}
+
+    # --- act + observe ---------------------------------------------------------
+    async def act_and_observe(
+        self,
+        action: str,
+        ref: str | None = None,
+        text: str | None = None,
+        key: str | None = None,
+        script: str | None = None,
+        exact: bool = False,
+        watch_ms: int = 3000,
+    ) -> dict:
+        """Perform ONE action, then watch the page for `watch_ms` and report
+        what appeared/disappeared, in a single tool call.
+
+        Any transient UI feedback (a toast, a snackbar, an inline validation
+        message) that appears and disappears on its own is a universal
+        pattern — the problem is timing: if "act" and "read the result" are
+        two separate tool calls, the round-trip between them can outlast the
+        message's whole lifetime (as short as ~2.5-4s in practice). This
+        reuses the bootstrap's MutationObserver (already running from before
+        the action, via Page.addScriptToEvaluateOnNewDocument — see inject.py)
+        instead of installing one at action time, which would miss anything
+        that lands in the first tens of milliseconds after the click.
+
+        action — one of: click, js_click, fill, press_key, js, popup_option.
+        Returns {"action_error", "timeline", "console_delta", + snapshot fields}.
+        """
+        if action not in _ACT_AND_OBSERVE_ACTIONS:
+            raise BadArgumentError(
+                f"action={action!r} desconocida. Usa: {', '.join(sorted(_ACT_AND_OBSERVE_ACTIONS))}."
+            )
+
+        conn = self._require_conn()
+        mark = await conn.call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "({markTime: Date.now(), "
+                    "cursor: (window.__fbm ? window.__fbm.mutations.length : 0)})"
+                ),
+                "returnByValue": True,
+            },
+            session_id=self._session_id,
+        )
+        mark_value = (mark.get("result") or {}).get("value") or {"markTime": 0, "cursor": 0}
+
+        action_error = None
+        try:
+            await self._dispatch_action(
+                action, ref=ref, text=text, key=key, script=script, exact=exact
+            )
+        except Exception as exc:
+            # An action failure is itself something worth reporting alongside
+            # whatever DID happen in the watch window — not a reason to abort
+            # before observing (e.g. a click that hit a stale ref might still
+            # have been preceded by a mutation worth seeing).
+            action_error = str(exc)
+
+        await asyncio.sleep(watch_ms / 1000.0)
+
+        timeline = await self._read_mutation_timeline(mark_value["cursor"], mark_value["markTime"])
+        console_delta = self.read_console(since_ms=watch_ms + 500)
+        snap = await self.snapshot()
+        return {
+            "action_error": action_error,
+            "timeline": timeline,
+            "console_delta": console_delta,
+            "snapshot_id": snap["snapshot_id"],
+            "snapshot": snap["snapshot"],
+            "refs": snap["refs"],
+        }
+
+    async def _dispatch_action(
+        self,
+        action: str,
+        *,
+        ref: str | None,
+        text: str | None,
+        key: str | None,
+        script: str | None,
+        exact: bool,
+    ) -> None:
+        if action == "click":
+            await self._do_click(ref)
+        elif action == "js_click":
+            await self._do_js_click(ref)
+        elif action == "fill":
+            await self._do_fill(ref, text or "")
+        elif action == "press_key":
+            await self._do_press_key(key or "", ref)
+        elif action == "js":
+            await self._do_js_eval(script or "", ref, None)
+        elif action == "popup_option":
+            await self._do_click_popup_option(text or "", exact)
+
+    async def _read_mutation_timeline(self, cursor: int, mark_time: float) -> list[str]:
+        conn = self._require_conn()
+        try:
+            res = await conn.call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "window.__fbm ? window.__fbm.mutations.slice(" + str(int(cursor)) + ") : []"
+                    ),
+                    "returnByValue": True,
+                },
+                session_id=self._session_id,
+            )
+        except Exception:
+            return []
+        entries = (res.get("result") or {}).get("value") or []
+        lines = []
+        for entry in entries:
+            offset_ms = int(entry.get("t", mark_time) - mark_time)
+            node = entry.get("node") or {}
+            desc = node.get("tag") or "?"
+            if node.get("role"):
+                desc += f"[role={node['role']}]"
+            if node.get("text"):
+                desc += f' "{node["text"]}"'
+            symbol = {"added": "+", "removed": "-"}.get(entry.get("kind"), "~")
+            lines.append(f"+{offset_ms}ms {symbol} {desc}")
+        return lines
 
     # --- helpers -------------------------------------------------------------
     def _require_conn(self) -> CDPConnection:

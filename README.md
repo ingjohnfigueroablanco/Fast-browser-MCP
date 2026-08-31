@@ -132,6 +132,7 @@ The browser runs **inside the container**. `localhost` inside Docker ≠ your de
 | `list_persistent` | List identifiers of registered persistent scripts |
 | `remove_persistent` | Remove a persistent script by identifier |
 | `click_popup_option` | Resolve the currently-open dropdown/menu/listbox and click the matching option, in one call |
+| `act_and_observe` | Act, then watch the DOM/console for `watch_ms` — one call instead of racing a toast's lifetime |
 
 ### Error format
 
@@ -176,6 +177,19 @@ accessibility tree every snapshot fetches). Prefer `click_popup_option(text)`
 over clicking a raw `@eN` for a dropdown option: it resolves the open popup
 the same way and clicks inside exactly that subtree in one call, falling back
 to a JS-based visible-container search when the site has no ARIA wiring.
+
+### Transient UI feedback (toasts, inline errors) — `act_and_observe`
+
+A toast/snackbar/inline validation message can appear and disappear entirely
+within ~2.5-4s — shorter than the round-trip between one tool call that acts
+and a separate one that reads the result. `act_and_observe(action, ref=...,
+watch_ms=3000)` performs the action and watches the DOM (via the bootstrap's
+already-running MutationObserver — no installation delay) and the console
+buffer for `watch_ms`, returning a timeline of what appeared/disappeared and
+when, plus any new console output, in one call. For a suspected error after
+any action, check `console_delta` (or `read_console`) before the DOM — an
+error toast fades in seconds, but the `console.error` it usually also fires
+persists in the buffer far longer.
 
 ### `click` vs `js_click`
 
